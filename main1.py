@@ -2,6 +2,7 @@ import itertools
 import json
 import math
 import sys
+from collections import Counter
 from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import Dict, List, Tuple
@@ -20,7 +21,7 @@ def debug(message: any):
 
 
 # Function to calculate the Euclidean distance between two points
-def distance(p1, p2):
+def distance(p1: Tuple[int, int], p2: Tuple[int, int]):
     return math.sqrt((p2[0] - p1[0]) ** 2 + (p2[1] - p1[1]) ** 2)
 
 
@@ -58,9 +59,7 @@ def orientation(p1, p2, p3):
      0 if the points are collinear.
     """
     # Compute the determinant of the matrix
-    prod = (p3["y"] - p1["y"]) * (p2["x"] - p1["x"]) - (p2["y"] - p1["y"]) * (
-        p3["x"] - p1["x"]
-    )
+    prod = (p3[1] - p1[1]) * (p2[0] - p1[0]) - (p2[1] - p1[1]) * (p3[0] - p1[0])
     return sign(prod)
 
 
@@ -143,14 +142,42 @@ class TransportLine:
     def get_transport_lines_unserved_by_pods(cls):
         all_buildings = set()
         all_buildings_with_pods = set()
-        buildings_without_pods = []
+
         for transport_line in TRANSPORT_LINES.values():
+            # debug(transport_line)
             all_buildings.add(transport_line.building_1.id)
             all_buildings.add(transport_line.building_2.id)
+
         for pod in PODS.values():
             for building_id in pod.path:
                 all_buildings_with_pods.add(building_id)
+
+        # debug("all_buildings")
+        # debug(all_buildings)
+        # debug("all_buildings_with_pods")
+        # debug(all_buildings_with_pods)
+
         return all_buildings - all_buildings_with_pods
+
+
+class PotentialTransportLine(TransportLine):
+    pass
+
+    def is_valid(self):
+        if self._does_it_intersect():
+            return False
+        return True
+
+    def _does_it_intersect(self):
+        for transport_line in TRANSPORT_LINES.values():
+            if segmentsIntersect(
+                A=self.building_1.coordinates,
+                B=self.building_2.coordinates,
+                C=transport_line.building_1.coordinates,
+                D=transport_line.building_2.coordinates,
+            ):
+                return True
+        return False
 
 
 @dataclass
@@ -164,10 +191,34 @@ class Pod:
 
 
 @dataclass
+class PotentialPod(Pod):
+    pass
+
+
+@dataclass
 class Building:
     id: int
     type: int
-    coordinates: List[int]
+    coordinates: Tuple[int, int]
+
+    def __str__(self):
+        return f"ID: {self.id} | Coords: {str(self.coordinates)} | Type: {self.type}"
+
+    def dump(self):
+        debug(
+            json.dumps(
+                str(
+                    {
+                        "type": "Building",
+                        "id": self.id,
+                        "type": self.type,
+                        "coordinates": self.coordinates,
+                    }
+                ),
+                default=str,
+                indent=2,
+            )
+        )
 
     def calc_distance_to_building(self, other_building: "Building") -> float:
         return distance(
@@ -201,20 +252,25 @@ class Building:
         # Get all unique combinations of 2 buildings
         building_pairs = list(itertools.combinations(BUILDINGS.values(), 2))
 
+        # prioritize connecting landing pads to non-landing pads by distance
         supplemented_building_pairs = [
             dict(
                 building_1=b1,
                 building_2=b2,
-                is_pad=(
+                one_is_pad=(
                     isinstance(b1, BuildingLandingPad)
-                    or isinstance(b2, BuildingLandingPad)
+                    ^ isinstance(b2, BuildingLandingPad)
                 ),
                 distance_between=b1.calc_distance_to_building(b2),
+                has_existing_transport_line=TransportLine.get_transport_line_by_buildings(
+                    building_1=b1,
+                    building_2=b2,
+                )
+                is not None,
                 existing_transport_line=TransportLine.get_transport_line_by_buildings(
                     building_1=b1,
                     building_2=b2,
                 ),
-                can_connect_without_intersect=True,  # TODO implement this
             )
             for b1, b2 in building_pairs
         ]
@@ -222,21 +278,102 @@ class Building:
         sorted_building_pairs = sorted(
             supplemented_building_pairs,
             key=lambda x: (
-                not x[
-                    "existing_transport_line"
+                not x["one_is_pad"],  # Sort with True as higher priority (prioritized)
+                x[
+                    "has_existing_transport_line"
                 ],  # Sort with True as lower priority (deprioritized)
-                x["is_pad"],  # Sort with True as higher priority (prioritized)
                 x["distance_between"],  # Sort by distance as the final criterion
             ),
         )
 
+        debug(json.dumps(sorted_building_pairs[0:10], default=str, indent=5))
+
         return sorted_building_pairs
+
+    @classmethod
+    def find_pairs_of_same_type(
+        cls, ensure_one_is_landing=True
+    ) -> List[Tuple["Building", "Building", float]]:
+        # Group buildings by type
+        buildings_by_type = {}
+
+        buildings = BUILDINGS.values()
+
+        for building in buildings:
+            building_type = (
+                building.type if building.type > 0 else building.prominent_type
+            )
+            if building_type not in buildings_by_type:
+                buildings_by_type[building_type] = []
+            buildings_by_type[building_type].append(building)
+
+        # debug(json.dumps(buildings_by_type, default=str, indent=1))
+
+        result_pairs = []
+
+        # For each type, find pairs and calculate distances
+        for building_type, building_list in buildings_by_type.items():
+            for i in range(len(building_list)):
+                for j in range(i + 1, len(building_list)):
+
+                    building1 = building_list[i]
+                    building2 = building_list[j]
+
+                    if ensure_one_is_landing:
+                        if not (
+                            isinstance(building1, BuildingLandingPad)
+                            ^ isinstance(building2, BuildingLandingPad)
+                        ):
+                            # debug("at least one must be a BuildingLandingPad, skipping")
+                            continue
+
+                    dist = distance(building1.coordinates, building2.coordinates)
+                    result_pairs.append((building1, building2, dist))
+
+        # Sort pairs by distance (increasing)
+        result_pairs.sort(key=lambda x: x[2])
+
+        return result_pairs
 
 
 @dataclass
 class BuildingLandingPad(Building):
     num_astronauts: int
     astronaut_types: List[int]
+
+    def __str__(self):
+        str = super().__str__()
+        str += f" | Astr Type: {self.prominent_type}"
+        return str
+
+    def dump(self):
+        debug(
+            json.dumps(
+                str(
+                    {
+                        "type": "BuildingLandingPad",
+                        "id": self.id,
+                        "type": self.type,
+                        "coordinates": self.coordinates,
+                        "prominent_type": self.prominent_type,
+                        "astronaut_types": self.astronaut_types,
+                    }
+                ),
+                default=str,
+                indent=2,
+            )
+        )
+
+    @property
+    def prominent_type(self):
+        return Counter(self.astronaut_types).most_common(1)[0][
+            0
+        ]  # Return the most common integer
+
+
+@dataclass
+class Path:
+    nodes: List[Building]
 
 
 @dataclass
@@ -361,6 +498,39 @@ def output_actions(actions: List[Action]):
     print(action_str)
 
 
+def build_bidirectional_path(buildings):
+    # Step 1: Create an adjacency list for bidirectional connections
+    from collections import defaultdict
+
+    adjacency_list = defaultdict(list)
+    for building1, building2 in buildings:
+        adjacency_list[building1].append(building2)
+        adjacency_list[building2].append(building1)
+
+    # Step 2: Start from any building, say building 0 or first in the input, and traverse the graph
+    start_building = buildings[0][0]
+    path = []
+    visited = set()
+
+    def traverse(building):
+        path.append(building)
+        visited.add(building)
+
+        # Visit all connected buildings that have not yet been visited
+        for neighbor in adjacency_list[building]:
+            if neighbor not in visited:
+                traverse(neighbor)
+                path.append(
+                    building
+                )  # Backtrack to the current building after visiting a neighbor
+
+    traverse(start_building)
+
+    # debug(path)
+
+    return path
+
+
 TRANSPORT_LINES: Dict[str, TransportLine] = {}
 PODS: Dict[int, Pod] = {}
 BUILDINGS: Dict[int, Building] = {}
@@ -368,6 +538,11 @@ BUILDINGS: Dict[int, Building] = {}
 
 # game loop
 while True:
+
+    # Reset transport lines and pods
+    TRANSPORT_LINES = {}
+    PODS = {}
+
     resources = int(input())
     num_travel_routes = int(input())
 
@@ -394,11 +569,12 @@ while True:
     num_new_buildings = int(input())
     for i in range(num_new_buildings):
         building_properties = [int(j) for j in input().split()]
-        if len(building_properties) > 4:
+        # debug(building_properties)
+        if building_properties[0] == 0:
             new_buildings.append(
                 BuildingLandingPad(
-                    id=int(building_properties[0]),
-                    type=int(building_properties[1]),
+                    id=int(building_properties[1]),
+                    type=int(building_properties[0]),
                     coordinates=[int(v) for v in building_properties[2:4]],
                     num_astronauts=int(building_properties[5]),
                     astronaut_types=building_properties[6:],
@@ -407,8 +583,8 @@ while True:
         else:
             new_buildings.append(
                 Building(
-                    id=int(building_properties[0]),
-                    type=int(building_properties[1]),
+                    id=int(building_properties[1]),
+                    type=int(building_properties[0]),
                     coordinates=[int(v) for v in building_properties[2:4]],
                 )
             )
@@ -437,7 +613,7 @@ while True:
                 transport_lines.append(transport_line)
             if not transport_line.id in TRANSPORT_LINES.keys():
                 TRANSPORT_LINES[transport_line.id] = transport_line
-        debug(TRANSPORT_LINES)
+        # debug(TRANSPORT_LINES)
 
     program_inputs = ProgramInput(
         num_resources=resources,
@@ -449,6 +625,7 @@ while True:
         new_buildings=new_buildings,
     )
 
+    # debug("INPUT STATE.....")
     # program_inputs.print_state()
 
     remaining_resources = program_inputs.num_resources
@@ -456,61 +633,26 @@ while True:
     actions: List[Action] = []
 
     ############
-    # Create pods from tubes
+    # POD MANAGEMENT
     ############
 
-    debug(BUILDINGS)
-    building_pairs = Building.get_building_pairs_by_priority()
-    for supplemented_building_pairs in building_pairs:
-        debug(f"Remaining resources: {remaining_resources}")
-        debug(
-            f"Building pair: {json.dumps(supplemented_building_pairs, default=str, indent=2)}"
-        )
-        existing_transport_line = supplemented_building_pairs.get(
-            "existing_transport_line"
-        )
-        if existing_transport_line:
-            debug(f"TransportLine already exists: {str(existing_transport_line)}")
-            upgrade_cost = existing_transport_line.calc_upgrade_cost()
-            debug(upgrade_cost)
-            # if upgrade_cost <= remaining_resources:
-            #     actions.append(ActionUpgrade(transport_line=transport_line_to_build))
-            #     remaining_resources -= upgrade_cost
-
-            # else:
-            #     debug("too expensive to upgrade transport line")
-            continue
-
-        debug("TransportLine doesn't exist...")
-
-        transport_line_to_build = TransportLine(
-            building_1=supplemented_building_pairs.get("building_1"),
-            building_2=supplemented_building_pairs.get("building_2"),
-        )
-        debug(f"TransportLine doesn't exist, might create?")
-
-        transport_line_to_build.dump()
-
-        build_cost = transport_line_to_build.calc_build_cost()
-        if build_cost <= remaining_resources:
-            debug(transport_line_to_build)
-            debug(transport_line_to_build.calc_build_cost())
-            actions.append(ActionTube(transport_line=transport_line_to_build))
-            remaining_resources -= build_cost
-        else:
-            debug("too expensive to build")
-
+    debug("CREATING PODS....")
+    debug(f"Current # of pods: {len(PODS)}")
     buildings_without_pods = TransportLine.get_transport_lines_unserved_by_pods()
+    debug("BUILDINGS WITHOUT PODS:")
     debug(json.dumps(buildings_without_pods, default=str, indent=2))
-    if len(BUILDINGS):
-        unoptimized_paths = sorted(list(BUILDINGS.keys()))
-        unoptimized_paths.extend([unoptimized_paths[0]])
-        debug("unoptimized_paths")
-        debug(unoptimized_paths)
+    if len(TRANSPORT_LINES.keys()) and len(buildings_without_pods):
+        path = build_bidirectional_path(
+            buildings=[
+                (transport_line.building_1.id, transport_line.building_2.id)
+                for transport_line in TRANSPORT_LINES.values()
+            ]
+        )
+
         pod_with_all_paths = Pod(
             id=len(PODS) + 1,
-            num_stops=len(unoptimized_paths),
-            path=unoptimized_paths,
+            num_stops=len(path),
+            path=path,
         )
         debug(json.dumps(str(pod_with_all_paths), default=str, indent=2))
 
@@ -519,7 +661,90 @@ while True:
             actions.append(ActionPod(pod=pod_with_all_paths))
             PODS[pod_with_all_paths.id] = pod_with_all_paths
         else:
-            debug("Too expensive to create pod...r")
+            debug("Too expensive to create pod...")
+
+    ############
+    # TUBE MANAGEMENT
+    ############
+
+    debug("CREATING TUBES BETWEEN BUILDINGS....")
+
+    building_landing_pad_to_building = 0
+    if True:
+        same_type = Building.find_pairs_of_same_type()
+        for same_type_building in same_type:
+            debug(same_type_building[0])
+            debug(same_type_building[0].dump())
+            # debug(type(same_type_building[0]))
+            # debug(same_type_building[0].type)
+            debug(same_type_building[1])
+            debug(same_type_building[1].dump())
+            # debug(type(same_type_building[1]))
+            # debug(same_type_building[1].type)
+
+            pot_transport_line = PotentialTransportLine(
+                building_1=same_type_building[0],
+                building_2=same_type_building[1],
+            )
+            build_cost = pot_transport_line.calc_build_cost()
+            if pot_transport_line.is_valid() and build_cost <= remaining_resources:
+                actions.append(ActionTube(transport_line=pot_transport_line))
+                remaining_resources -= build_cost
+                TRANSPORT_LINES[pot_transport_line.id] = pot_transport_line
+                building_landing_pad_to_building += 1
+            else:
+                debug("potential transport line is invalid!")
+
+            if remaining_resources < 500:
+                debug("remaining resources < 500, breaking...")
+                break
+            if building_landing_pad_to_building > 2:
+                debug("building_landing_pad_to_building > 2, breaking...")
+                break
+
+    # debug(BUILDINGS)
+    # debug(len(BUILDINGS))
+    if False:
+        building_pairs = Building.get_building_pairs_by_priority()
+        for supplemented_building_pairs in building_pairs[0:8]:
+            debug(f"Remaining resources: {remaining_resources}")
+            # debug(
+            #     f"Building pair: {json.dumps(supplemented_building_pairs, default=str, indent=2)}"
+            # )
+            existing_transport_line = supplemented_building_pairs.get(
+                "existing_transport_line"
+            )
+            if existing_transport_line:
+                debug(f"TransportLine already exists: {str(existing_transport_line)}")
+                upgrade_cost = existing_transport_line.calc_upgrade_cost()
+                debug(upgrade_cost)
+                # if upgrade_cost <= remaining_resources:
+                #     actions.append(ActionUpgrade(transport_line=transport_line_to_build))
+                #     remaining_resources -= upgrade_cost
+
+                # else:
+                #     debug("too expensive to upgrade transport line")
+                continue
+
+            debug("TransportLine doesn't exist...")
+
+            transport_line_to_build = TransportLine(
+                building_1=supplemented_building_pairs.get("building_1"),
+                building_2=supplemented_building_pairs.get("building_2"),
+            )
+            debug(f"TransportLine doesn't exist, might create?")
+
+            transport_line_to_build.dump()
+
+            build_cost = transport_line_to_build.calc_build_cost()
+            if build_cost <= remaining_resources:
+                debug(transport_line_to_build)
+                # debug(transport_line_to_build.calc_build_cost())
+                actions.append(ActionTube(transport_line=transport_line_to_build))
+                remaining_resources -= build_cost
+                TRANSPORT_LINES[transport_line_to_build.id] = transport_line_to_build
+            else:
+                debug("too expensive to build")
 
     if not actions:
         actions.append(ActionWait())
