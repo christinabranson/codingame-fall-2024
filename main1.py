@@ -1,14 +1,19 @@
 import itertools
 import json
 import math
+import random
 import sys
-from collections import Counter
-from dataclasses import asdict, dataclass
+from collections import Counter, defaultdict
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 # Auto-generated code below aims at helping you parse
 # the standard input according to the problem statement.
+
+POD_COST = 1000
+MAX_TRANSPORT_LINE_COUNT = 4
 
 
 def debug(message: any):
@@ -80,14 +85,69 @@ def segmentsIntersect(A, B, C, D):
     )
 
 
-@dataclass
+def detect_anomalous_keys(counts, z_threshold=4):
+    """
+    Detect keys with anomalously high values in a dictionary based on z-score.
+
+    :param counts: defaultdict or dict with keys and their respective counts.
+    :param z_threshold: Threshold for z-score to consider a value anomalous (default is 2).
+    :return: List of keys that have anomalously high values.
+    """
+    # Extract the values from the dictionary
+    values = list(counts.values())
+    if not len(values):
+        return []
+
+    try:
+
+        # Step 1: Calculate the mean
+        mean = sum(values) / len(values)
+
+        # Step 2: Calculate the standard deviation manually
+        variance = sum((x - mean) ** 2 for x in values) / len(values)
+        std_dev = variance**0.5
+
+        # Step 3: Identify keys with counts that are anomalously high
+        anomalous_keys = []
+        for key, value in counts.items():
+            z_score = (value - mean) / std_dev
+            if z_score > z_threshold:
+                anomalous_keys.append(key)
+
+        return anomalous_keys
+    except Exception as exc:
+        debug(exc)
+        return []
+
+
+def subtract_arrays(array1, array2):
+    """
+    Subtracts elements of array2 from array1 element-wise.
+
+    :param array1: The first list of numbers.
+    :param array2: The second list of numbers.
+    :return: A list where each element is the result of subtracting corresponding elements of array2 from array1.
+    """
+    return [item for item in array1 if item not in array2]
+
+
+@dataclass(frozen=True)
 class TransportLine:
     building_1: "Building"
     building_2: "Building"
     capacity: int = 1
 
+    @property
+    def id(self):
+        building_ids = [
+            self.building_1.id,
+            self.building_2.id,
+        ]
+        building_ids.sort()
+        return ";".join([str(bid) for bid in building_ids])
+
     def __str__(self):
-        return self.id
+        return f"Building 1: {self.building_1.id} | Building 2: {self.building_2.id}"
 
     def dump(self):
         debug(
@@ -110,8 +170,8 @@ class TransportLine:
         )
 
     @property
-    def id(self):
-        return f"{self.building_1.id}-{self.building_2.id}"
+    def build_cost(self):
+        return self.calc_build_cost()
 
     def calc_distance_between_buildings(self) -> float:
         return self.building_1.calc_distance_to_building(self.building_2)
@@ -159,14 +219,186 @@ class TransportLine:
 
         return all_buildings - all_buildings_with_pods
 
+    @classmethod
+    def get_connected_buildings(
+        cls, adjacency_list: Dict["Building", List["Building"]], building_id
+    ) -> List["Building"]:
+        # Use adjacency list to get connected buildings in O(1)
+        return adjacency_list.get(building_id, [])
+
+    @classmethod
+    def build_adjacency_list(cls) -> Dict["Building", List["Building"]]:
+        # Build an adjacency list to avoid recomputing neighbors
+        adjacency_list = {}
+        # debug(type(TRANSPORT_LINES))
+        # debug(type(TRANSPORT_LINES.values()))
+        for transport_line in list(TRANSPORT_LINES.values()):
+            # debug(transport_line)
+            # debug(transport_line.id)
+            if not isinstance(transport_line, TransportLine):
+                debug(transport_line)
+                assert False
+            if transport_line.building_1.id not in adjacency_list:
+                adjacency_list[transport_line.building_1.id] = []
+            if transport_line.building_2.id not in adjacency_list:
+                adjacency_list[transport_line.building_2.id] = []
+
+            # Add bidirectional connections
+            adjacency_list[transport_line.building_1.id].append(
+                transport_line.building_2
+            )
+            adjacency_list[transport_line.building_2.id].append(
+                transport_line.building_1
+            )
+
+        return adjacency_list
+
+    @classmethod
+    def generate_paths_from_building(
+        cls,
+        start_building: "Building",
+        adjacency_list,
+        min_unique_nodes: int = 2,
+        max_depth: int = 4,
+    ) -> List[List["Building"]]:
+        debug("start_building")
+        debug(start_building)
+        # adjacency_list = cls.build_adjacency_list()  # Precompute neighbors
+        stack = [
+            (start_building.id, [start_building.id], set([start_building.id]))
+        ]  # Track the path and visited set
+        # current_building = start_building.id
+        # current_path = [start_building.id]
+        # visited = set()
+        # visited.add(start_building.id)
+
+        paths = []
+
+        while stack:
+            current_building, current_path, visited = stack.pop()
+
+            # If we returned to the start and the path has more than 1 node, add to result
+            if current_building == start_building and len(current_path) > 1:
+                if len(visited) >= min_unique_nodes:
+                    paths.append(current_path[:])
+
+            # Limit maximum depth to avoid long paths (optional)
+            if max_depth is not None and len(current_path) > max_depth:
+                continue
+
+            # Explore neighbors
+            for neighbor in cls.get_connected_buildings(
+                adjacency_list, current_building
+            ):
+                # Allow revisits only if needed
+                # new_path = current_path + [neighbor]
+                new_visited = visited.copy()
+                new_visited.add(neighbor.id)
+
+                # current_building = neighbor.id
+                # current_path = current_path + [neighbor.id]
+                # visited.add(neighbor.id)
+
+                stack.append((neighbor.id, current_path + [neighbor.id], new_visited))
+
+        return paths
+
+    @classmethod
+    def get_transport_lines_prioritized_least_connecions(cls) -> List["TransportLine"]:
+        debug("get_transport_lines_prioritized_least_connecions")
+        copy_transport_lines = deepcopy(list(TRANSPORT_LINES.values()))
+        supp_transport_lines = []
+        for tl in copy_transport_lines:
+
+            supp_transport_lines.append(
+                (
+                    tl,
+                    min(
+                        tl.building_1.transport_line_count,
+                        tl.building_2.transport_line_count,
+                    ),
+                )
+            )
+
+        ordered = sorted(supp_transport_lines, key=lambda x: x[1], reverse=False)
+        # debug("ordered")
+        # debug(json.dumps(ordered, indent=2, default=str))
+
+        return [o[0] for o in ordered]
+
+
 
 class PotentialTransportLine(TransportLine):
     pass
 
+    @staticmethod
+    def create_valid_transport_line(
+        building_1: "Building",
+        building_2: "Building",
+        remaining_resources: float,
+        limit_types: List[int],
+    ) -> Optional["PotentialTransportLine"]:
+
+        if limit_types:
+            if building_1.type in limit_types:
+                debug("Building 1 is in limit types..")
+                return None
+
+            if building_2.type in limit_types:
+                debug("Building 2 is in limit types..")
+                return None
+
+        if building_1 == building_2:
+            return None
+
+        pot_line = PotentialTransportLine(
+            building_1=building_1,
+            building_2=building_2,
+        )
+        build_cost = pot_line.build_cost
+        if build_cost > remaining_resources:
+            debug(
+                f"PotentialTransportLine invalid due cost {build_cost}/{remaining_resources} "
+            )
+            return None
+
+        if not pot_line.is_valid():
+            return None
+        return pot_line
+
     def is_valid(self):
-        if self._does_it_intersect():
+
+        if self._does_it_already_exist():
+            debug("PotentialTransportLine already exists!")
             return False
+
+        if self._buildings_have_too_many_connections():
+            debug(
+                "PotentialTransportLine contains at least 1 building which is already connected"
+            )
+            return False
+
+        if self._does_it_intersect():
+            debug("PotentialTransportLine intersects another line")
+            return False
+        
+        if self._does_it_intersect_a_building():
+            debug("PotentialTransportLine intersects another building")
+            return False
+
         return True
+
+    def _does_it_already_exist(self):
+        return self.id in TRANSPORT_LINES.keys()
+
+    def _buildings_have_too_many_connections(self):
+        if self.building_1.transport_line_count >= MAX_TRANSPORT_LINE_COUNT:
+            return True
+
+        if self.building_2.transport_line_count >= MAX_TRANSPORT_LINE_COUNT:
+            return True
+
+        return False
 
     def _does_it_intersect(self):
         for transport_line in TRANSPORT_LINES.values():
@@ -175,6 +407,17 @@ class PotentialTransportLine(TransportLine):
                 B=self.building_2.coordinates,
                 C=transport_line.building_1.coordinates,
                 D=transport_line.building_2.coordinates,
+            ):
+                return True
+        return False
+    
+    def _does_it_intersect_a_building(self):
+        return False
+        for building in BUILDINGS.get_buildings_as_list():
+            if pointOnSegment(
+                A=building.coordinates,
+                B=self.building_1.coordinates,
+                C=self.building_2.coordinates,
             ):
                 return True
         return False
@@ -187,7 +430,7 @@ class Pod:
     path: List[int]
 
     def calc_cost(self):
-        return 1000
+        return POD_COST
 
 
 @dataclass
@@ -195,7 +438,7 @@ class PotentialPod(Pod):
     pass
 
 
-@dataclass
+@dataclass(frozen=True)
 class Building:
     id: int
     type: int
@@ -218,6 +461,16 @@ class Building:
                 default=str,
                 indent=2,
             )
+        )
+
+    @property
+    def transport_line_count(self):
+        return len(
+            [
+                tl
+                for tl in list(TRANSPORT_LINES.values())
+                if tl.building_1 == self or tl.building_2 == self
+            ]
         )
 
     def calc_distance_to_building(self, other_building: "Building") -> float:
@@ -291,23 +544,31 @@ class Building:
         return sorted_building_pairs
 
     @classmethod
-    def find_pairs_of_same_type(
-        cls, ensure_one_is_landing=True
+    def find_priority_building_pairs(
+        cls,
+        ensure_one_is_landing=True,
+        ensure_same_type=False,
     ) -> List[Tuple["Building", "Building", float]]:
-        # Group buildings by type
-        buildings_by_type = {}
 
-        buildings = BUILDINGS.values()
+        if ensure_same_type:
+            # Group buildings by type
+            buildings_by_type = {}
 
-        for building in buildings:
-            building_type = (
-                building.type if building.type > 0 else building.prominent_type
-            )
-            if building_type not in buildings_by_type:
-                buildings_by_type[building_type] = []
-            buildings_by_type[building_type].append(building)
+            buildings = BUILDINGS.values()
 
-        # debug(json.dumps(buildings_by_type, default=str, indent=1))
+            for building in buildings:
+                building_type = (
+                    building.type if building.type > 0 else building.prominent_type
+                )
+                if building_type not in buildings_by_type:
+                    buildings_by_type[building_type] = []
+                buildings_by_type[building_type].append(building)
+
+            # debug(json.dumps(buildings_by_type, default=str, indent=1))
+        else:
+            buildings_by_type = {"dont_care": []}
+            for building in buildings:
+                buildings_by_type["dont_care"].append(building)
 
         result_pairs = []
 
@@ -336,7 +597,7 @@ class Building:
         return result_pairs
 
 
-@dataclass
+@dataclass(frozen=True)
 class BuildingLandingPad(Building):
     num_astronauts: int
     astronaut_types: List[int]
@@ -369,6 +630,123 @@ class BuildingLandingPad(Building):
         return Counter(self.astronaut_types).most_common(1)[0][
             0
         ]  # Return the most common integer
+
+
+import math
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+
+@dataclass
+class BuildingDistanceMatrix:
+    buildings: Dict[int, Building] = field(default_factory=dict)
+    distance_matrix: List[List[float]] = field(init=False, default_factory=list)
+
+    def __post_init__(self):
+        self.distance_matrix = self.create_distance_matrix()
+
+    def get_buildings_as_list(self, filter_type: int = None) -> List[Building]:
+        buildings_list = list(self.buildings.values())
+
+        if filter_type is not None:
+            buildings_list = [
+                building for building in buildings_list if building.type == filter_type
+            ]
+
+        return buildings_list
+
+    def create_distance_matrix(self) -> List[List[float]]:
+        building_list = list(self.buildings.values())
+        n = len(building_list)
+        matrix = [[0] * n for _ in range(n)]
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = distance(building_list[i].coordinates, building_list[j].coordinates)
+                matrix[i][j] = matrix[j][i] = d
+        return matrix
+
+    def add_building(self, new_building: Building):
+        # Add new building to the dictionary
+        self.buildings[new_building.id] = new_building
+        building_list = list(self.buildings.values())
+        n = len(building_list)
+
+        # Update the distance matrix
+        for i in range(n - 1):
+            d = distance(building_list[i].coordinates, new_building.coordinates)
+            self.distance_matrix[i].append(d)
+        # Add a new row for the new building
+        new_row = [0] * n
+        self.distance_matrix.append(new_row)
+        for i in range(n - 1):
+            self.distance_matrix[-1][i] = self.distance_matrix[i][-1]
+
+    def get_neighbors(
+        self,
+        building_id: int,
+        N: int,
+        building_types: Optional[List[int]] = None,
+        exclude_list: Optional[List[Building]] = None,
+    ) -> List[Building]:
+        if building_id not in self.buildings:
+            return []
+
+        building_idx = list(self.buildings).index(building_id)
+        building_list = list(self.buildings.values())
+
+        # if exclude_list:
+        #     building_list = [b for b in building_list if b not in exclude_list]
+
+        # if building_types and len(building_types) > 0:
+        #     building_list = [b for b in building_list if b.type in building_types]
+
+        # debug("building_list")
+        # debug(building_list)
+
+        # Get distances from the building to others and sort by distance
+        distances = [
+            (i, dist)
+            for i, dist in enumerate(self.distance_matrix[building_idx])
+            if i != building_idx
+        ]
+        distances.sort(key=lambda x: x[1])
+
+        # debug("distances")
+        # debug(distances)
+
+        # Filter buildings by type if specified
+        if building_types is not None:
+            # debug(building_types)
+            distances = [
+                (i, dist)
+                for i, dist in distances
+                if building_list[i].type in building_types
+            ]
+            # building_list = [b for b in building_list if b.type in building_types]
+
+        if exclude_list is not None:
+            # debug(exclude_list)
+            distances = [
+                (i, dist)
+                for i, dist in distances
+                if building_list[i] not in exclude_list
+            ]
+            # building_list = [b for b in building_list if b.type in building_types]
+
+        try:
+            # Return the N closest buildings that match the type
+            closest_buildings = [building_list[i] for i, _ in distances[:N]]
+            # closest_buildings = []
+            # for i, _ in distances[:N]:
+            #     debug(i)
+            #     debug(_)
+            #     debug(building_list[i])
+            return closest_buildings
+        except Exception as exc:
+            debug(exc)
+            debug(json.dumps(building_list, default=str, indent=2))
+            debug(json.dumps(distances, default=str, indent=2))
+            raise
 
 
 @dataclass
@@ -498,6 +876,61 @@ def output_actions(actions: List[Action]):
     print(action_str)
 
 
+def build_bidirectional_path_from_transport_line(transport_lines: List[TransportLine]):
+    pass
+
+
+def find_paths(
+    transport_lines: List[TransportLine],
+    adjacency_list: Dict[int, List[Building]],
+    mirror: bool = False,
+    max_depth: int = 10,
+) -> List[List[Building]]:
+    """Find circular or mirrored paths from transport lines with repeated visits and max depth."""
+    if not adjacency_list.keys():
+        debug("no adjacency_list provided")
+        return []
+
+    paths = []
+
+    def dfs(current: Building, path: List[Building], start: Building, depth: int):
+        if depth > max_depth:
+            return  # Stop if max depth is exceeded
+
+        if len(path) > 1 and current == start:
+            # We found a circular path, add it to the list of paths
+            paths.append(path[:])
+            return
+
+        for neighbor in adjacency_list[current.id]:
+            if depth < max_depth:  # Continue if the depth limit has not been reached
+                path.append(neighbor)
+                dfs(neighbor, path, start, depth + 1)
+                path.pop()
+
+    # For each building, try to find circular or mirrored paths
+    for line in transport_lines:
+        # debug(line)
+        b1, b2 = line.building_1, line.building_2
+
+        # Circular path starting from building_1
+        dfs(b1, [b1], b1, 1)
+
+    # debug(json.dumps(paths, default=str, indent=1))
+
+    if mirror:
+        # Create mirrored paths
+        mirrored_paths = []
+        for path in paths:
+            mirrored_path = (
+                path + path[-2::-1]
+            )  # Mirror the path by excluding the last point and reversing
+            mirrored_paths.append(mirrored_path)
+        return mirrored_paths
+
+    return paths
+
+
 def build_bidirectional_path(buildings):
     # Step 1: Create an adjacency list for bidirectional connections
     from collections import defaultdict
@@ -533,7 +966,7 @@ def build_bidirectional_path(buildings):
 
 TRANSPORT_LINES: Dict[str, TransportLine] = {}
 PODS: Dict[int, Pod] = {}
-BUILDINGS: Dict[int, Building] = {}
+BUILDINGS = BuildingDistanceMatrix()
 
 
 # game loop
@@ -590,7 +1023,10 @@ while True:
             )
 
     for new_building in new_buildings:
-        BUILDINGS[new_building.id] = new_building
+        BUILDINGS.add_building(new_building=new_building)
+
+    # debug(json.dumps(BUILDINGS.buildings, default=str, indent=2))
+    # raise
 
     #######
     # examine transport lines....
@@ -598,12 +1034,8 @@ while True:
 
     if len(transport_line_data):
         for transport_line_d in transport_line_data:
-            building_1 = Building.get_building_from_params(
-                building_id=transport_line_d[0], buildings=BUILDINGS
-            )
-            building_2 = Building.get_building_from_params(
-                building_id=transport_line_d[1], buildings=BUILDINGS
-            )
+            building_1 = BUILDINGS.buildings.get(transport_line_d[0])
+            building_2 = BUILDINGS.buildings.get(transport_line_d[1])
             if building_1 and building_2:
                 transport_line = TransportLine(
                     building_1=building_1,
@@ -614,6 +1046,24 @@ while True:
             if not transport_line.id in TRANSPORT_LINES.keys():
                 TRANSPORT_LINES[transport_line.id] = transport_line
         # debug(TRANSPORT_LINES)
+
+    limit_types = []
+    building_type_count = defaultdict(int)
+    for b in BUILDINGS.get_buildings_as_list():
+        if b.type != 0:
+            building_type_count[b.type] += 1
+    anomalous_building_occ = detect_anomalous_keys(building_type_count)
+    limit_types.extend(anomalous_building_occ)
+    connected_types = defaultdict(int)
+    for tl in TRANSPORT_LINES.values():
+        connected_types[tl.building_1.type] += 1
+        connected_types[tl.building_2.type] += 1
+    limited_types_due_to_connections = detect_anomalous_keys(connected_types)
+    limit_types.extend(limited_types_due_to_connections)
+    limit_types = list(set(limit_types))
+
+    if len(limit_types):
+        debug(f"limiting the following types: {str(limit_types)}")
 
     program_inputs = ProgramInput(
         num_resources=resources,
@@ -631,6 +1081,10 @@ while True:
     remaining_resources = program_inputs.num_resources
     debug(f"Remaining resources: {remaining_resources}")
     actions: List[Action] = []
+    building_landing_pads = BUILDINGS.get_buildings_as_list(filter_type=0)
+    # debug(json.dumps(TRANSPORT_LINES, default=str, indent=1))
+
+    building_adjacency_list = TransportLine.build_adjacency_list()
 
     ############
     # POD MANAGEMENT
@@ -638,113 +1092,271 @@ while True:
 
     debug("CREATING PODS....")
     debug(f"Current # of pods: {len(PODS)}")
-    buildings_without_pods = TransportLine.get_transport_lines_unserved_by_pods()
-    debug("BUILDINGS WITHOUT PODS:")
-    debug(json.dumps(buildings_without_pods, default=str, indent=2))
-    if len(TRANSPORT_LINES.keys()) and len(buildings_without_pods):
-        path = build_bidirectional_path(
-            buildings=[
-                (transport_line.building_1.id, transport_line.building_2.id)
-                for transport_line in TRANSPORT_LINES.values()
-            ]
+
+    max_pods_created_per_turn = 2
+    created_pods = 0
+    if True and POD_COST <= remaining_resources and len(TRANSPORT_LINES.values()):
+        debug("In creating pods section...")
+
+        paths = find_paths(
+            transport_lines=list(TRANSPORT_LINES.values()),
+            adjacency_list=building_adjacency_list,
+            mirror=True,
         )
 
-        pod_with_all_paths = Pod(
-            id=len(PODS) + 1,
-            num_stops=len(path),
-            path=path,
-        )
-        debug(json.dumps(str(pod_with_all_paths), default=str, indent=2))
+        def sort_by_unique_items(list_of_lists):
+            """
+            Sorts a list of lists by the number of unique items in each sublist.
 
-        if pod_with_all_paths.calc_cost() <= remaining_resources:
-            debug("Can create pod...r")
-            actions.append(ActionPod(pod=pod_with_all_paths))
-            PODS[pod_with_all_paths.id] = pod_with_all_paths
-        else:
-            debug("Too expensive to create pod...")
+            :param list_of_lists: List of lists to be sorted.
+            :return: A sorted list of lists based on the number of unique items in each sublist.
+            """
+            return sorted(
+                list_of_lists,
+                key=lambda sublist: len(set([b.id for b in sublist])),
+                reverse=True,
+            )
+
+        paths = sort_by_unique_items(paths)
+
+        # debug("paths....")
+        # debug(json.dumps(paths, default=str, indent=1))
+        # raise
+
+        desired_path_length = 2
+        for path in paths:
+            path_ids = [b.id for b in path]
+            # debug(f"path length: {len(set(path_ids)) }")
+            if len(set(path_ids)) > desired_path_length:
+                desired_path_length = len(set(path_ids))
+                break
+
+        debug(f"desired_path_length: {desired_path_length}")
+
+        for path in paths:
+            path_ids = [b.id for b in path]
+            if len(set(path_ids)) < desired_path_length:
+                # debug("path too short, continuing....")
+                break
+            debug(f"evaluating path {str(path_ids)}")
+            if POD_COST <= remaining_resources:
+                pod = Pod(
+                    id=len(PODS) + 1,
+                    num_stops=len(path_ids),
+                    path=path_ids,
+                )
+                debug(f"Creating pod: {pod}")
+                actions.append(ActionPod(pod=pod))
+                PODS[pod.id] = pod
+                remaining_resources = remaining_resources - POD_COST
+                created_pods += 1
+            else:
+                debug("Too expensive to create pod...")
+                break
+
+            if remaining_resources <= POD_COST:
+                debug("remaining resources <= POD_COST, breaking...")
+                break
+
+            if created_pods > max_pods_created_per_turn:
+                debug("too many pods created this turn, breaking...")
+                break
+
+    debug("/CREATING PODS....")
 
     ############
     # TUBE MANAGEMENT
     ############
 
     debug("CREATING TUBES BETWEEN BUILDINGS....")
+    debug(f"Current # of transport lines: {len(TRANSPORT_LINES.values())}")
+    building_type_filters = [e for e in list(range(0, 19)) if e > 0]
+    building_type_filters = subtract_arrays(building_type_filters, limit_types)
+    if new_buildings:
+        is_first_round = len(TRANSPORT_LINES.values()) == 0
+        max_lines_created_per_turn = 10
+        created_lines = 0
 
-    building_landing_pad_to_building = 0
-    if True:
-        same_type = Building.find_pairs_of_same_type()
-        for same_type_building in same_type:
-            debug(same_type_building[0])
-            debug(same_type_building[0].dump())
-            # debug(type(same_type_building[0]))
-            # debug(same_type_building[0].type)
-            debug(same_type_building[1])
-            debug(same_type_building[1].dump())
-            # debug(type(same_type_building[1]))
-            # debug(same_type_building[1].type)
+        building_landing_pads = [
+            b
+            for b in building_landing_pads
+            if b.transport_line_count < MAX_TRANSPORT_LINE_COUNT
+        ]
+        # debug("building_landing_pads/!")
+        # debug(json.dumps(building_landing_pads,default=str,indent=1))
 
-            pot_transport_line = PotentialTransportLine(
-                building_1=same_type_building[0],
-                building_2=same_type_building[1],
+        for building_landing_pad in random.sample(
+            building_landing_pads, min(len(building_landing_pads), 20)
+        ):
+            # debug("list(set(building_landing_pad.astronaut_types))")
+            # debug(list(set(building_landing_pad.astronaut_types)))
+
+            if is_first_round:
+                building_type_filters = list(set(building_landing_pad.astronaut_types))
+
+            nearest_buildings = BUILDINGS.get_neighbors(
+                building_id=building_landing_pad.id,
+                N=5,
+                building_types=building_type_filters,
             )
-            build_cost = pot_transport_line.calc_build_cost()
-            if pot_transport_line.is_valid() and build_cost <= remaining_resources:
-                actions.append(ActionTube(transport_line=pot_transport_line))
-                remaining_resources -= build_cost
-                TRANSPORT_LINES[pot_transport_line.id] = pot_transport_line
-                building_landing_pad_to_building += 1
-            else:
-                debug("potential transport line is invalid!")
 
-            if remaining_resources < 500:
-                debug("remaining resources < 500, breaking...")
-                break
-            if building_landing_pad_to_building > 2:
-                debug("building_landing_pad_to_building > 2, breaking...")
-                break
+            for nearest_building in nearest_buildings:
+                # debug(json.dumps(nearest_buildings, default=str, indent=2))
+                pot_line = PotentialTransportLine.create_valid_transport_line(
+                    building_1=building_landing_pad,
+                    building_2=nearest_building,
+                    remaining_resources=remaining_resources,
+                    limit_types=limit_types,
+                )
+                if pot_line:
+                    actions.append(ActionTube(transport_line=pot_line))
+                    remaining_resources = remaining_resources - pot_line.build_cost
+                    TRANSPORT_LINES[pot_line.id] = pot_line
+                    created_lines += 1
 
-    # debug(BUILDINGS)
-    # debug(len(BUILDINGS))
-    if False:
-        building_pairs = Building.get_building_pairs_by_priority()
-        for supplemented_building_pairs in building_pairs[0:8]:
-            debug(f"Remaining resources: {remaining_resources}")
-            # debug(
-            #     f"Building pair: {json.dumps(supplemented_building_pairs, default=str, indent=2)}"
-            # )
-            existing_transport_line = supplemented_building_pairs.get(
-                "existing_transport_line"
-            )
-            if existing_transport_line:
-                debug(f"TransportLine already exists: {str(existing_transport_line)}")
-                upgrade_cost = existing_transport_line.calc_upgrade_cost()
-                debug(upgrade_cost)
-                # if upgrade_cost <= remaining_resources:
-                #     actions.append(ActionUpgrade(transport_line=transport_line_to_build))
-                #     remaining_resources -= upgrade_cost
+                if remaining_resources <= POD_COST:
+                    debug("remaining resources <= POD_COST, breaking...")
+                    break
 
-                # else:
-                #     debug("too expensive to upgrade transport line")
+                if created_lines >= max_lines_created_per_turn:
+                    debug("too many lines created")
+                    break
+
+    debug("/CREATING TUBES BETWEEN BUILDINGS....")
+    debug("EXTENDING TUBES BETWEEN BUILDINGS....")
+
+    debug(f"Current # of transport lines: {len(TRANSPORT_LINES.values())}")
+    debug(f"remaining_resources: {remaining_resources}")
+
+    max_lines_extended_per_turn = 10
+    extended_lines = 0
+
+    building_adjacency_list = TransportLine.build_adjacency_list()
+
+    # if len(TRANSPORT_LINES.values()) and remaining_resources <= POD_COST:
+    if len(TRANSPORT_LINES.values()):
+        # copy_transport_lines = deepcopy(list(TRANSPORT_LINES.values()))
+
+        # if limit_types:
+        #     copy_transport_lines = [
+        #         tl
+        #         for tl in copy_transport_lines
+        #         if tl.building_1.type not in limit_types
+        #         and tl.building_2.type not in limit_types
+        #     ]
+
+        # for transport_line in random.sample(
+        #     copy_transport_lines, min(len(copy_transport_lines), 100)
+        # ):
+        for (
+            transport_line
+        ) in TransportLine.get_transport_lines_prioritized_least_connecions():
+            building_1 = transport_line.building_1
+            building_2 = transport_line.building_2
+
+            if building_1.type == 0 and building_2.type == 0:
                 continue
 
-            debug("TransportLine doesn't exist...")
+            if (
+                building_1.transport_line_count > MAX_TRANSPORT_LINE_COUNT
+                or building_2.transport_line_count > MAX_TRANSPORT_LINE_COUNT
+            ):
+                continue
 
-            transport_line_to_build = TransportLine(
-                building_1=supplemented_building_pairs.get("building_1"),
-                building_2=supplemented_building_pairs.get("building_2"),
+            debug(f"Trying to extend line {str(transport_line)}")
+
+            debug("looking to extend lines for building_2")
+
+            building_2_types_to_filter = None
+            if len(limit_types):
+                building_2_types_to_filter = subtract_arrays(
+                    connected_types.keys(), limit_types
+                )
+
+            if building_2.type == 0:
+                building_2_types_to_filter = [0]
+
+            debug("building_2_types_to_filter")
+            debug(building_2_types_to_filter)
+
+            building_2_neighbors = BUILDINGS.get_neighbors(
+                building_id=building_2.id,
+                N=1 if building_2.type == 0 else 2,
+                building_types=building_2_types_to_filter,
+                exclude_list=TransportLine.get_connected_buildings(
+                    building_id=building_2.id,
+                    adjacency_list=building_adjacency_list,
+                ),
             )
-            debug(f"TransportLine doesn't exist, might create?")
 
-            transport_line_to_build.dump()
+            for building_2_neighbor in building_2_neighbors:
+                debug(f"building 2 has a neighbor: {building_2_neighbor.id}")
 
-            build_cost = transport_line_to_build.calc_build_cost()
-            if build_cost <= remaining_resources:
-                debug(transport_line_to_build)
-                # debug(transport_line_to_build.calc_build_cost())
-                actions.append(ActionTube(transport_line=transport_line_to_build))
-                remaining_resources -= build_cost
-                TRANSPORT_LINES[transport_line_to_build.id] = transport_line_to_build
-            else:
-                debug("too expensive to build")
+                pot_line = PotentialTransportLine.create_valid_transport_line(
+                    building_1=building_2,
+                    building_2=building_2_neighbor,
+                    remaining_resources=remaining_resources,
+                    limit_types=limit_types,
+                )
+                if pot_line:
+                    debug(pot_line)
+                    actions.append(ActionTube(transport_line=pot_line))
+                    remaining_resources = remaining_resources - pot_line.build_cost
+                    TRANSPORT_LINES[pot_line.id] = pot_line
+                    extended_lines += 1
+                    building_adjacency_list = TransportLine.build_adjacency_list()
+
+            # if remaining_resources <= POD_COST:
+            #     debug("remaining resources <= POD_COST, breaking...")
+            #     break
+
+            debug("looking to extend lines for building_1")
+            building_1_types_to_filter = None
+            if len(limit_types):
+                building_1_types_to_filter = subtract_arrays(
+                    connected_types.keys(), limit_types
+                )
+
+            if building_1.type == 0:
+                building_1_types_to_filter = [0]
+
+            debug("building_1_types_to_filter")
+            debug(building_1_types_to_filter)
+
+            building_1_neighbors = BUILDINGS.get_neighbors(
+                building_id=building_1.id,
+                N=1 if building_1.type == 0 else 2,
+                building_types=building_1_types_to_filter,
+                exclude_list=TransportLine.get_connected_buildings(
+                    building_id=building_1.id,
+                    adjacency_list=building_adjacency_list,
+                ),
+            )
+
+            for building_1_neighbor in building_1_neighbors:
+                debug(f"building 1 has a neighbor: {building_1_neighbor.id}")
+                pot_line = PotentialTransportLine.create_valid_transport_line(
+                    building_1=building_1,
+                    building_2=building_1_neighbor,
+                    remaining_resources=remaining_resources,
+                    limit_types=limit_types,
+                )
+                if pot_line:
+                    actions.append(ActionTube(transport_line=pot_line))
+                    remaining_resources = remaining_resources - pot_line.build_cost
+                    TRANSPORT_LINES[pot_line.id] = pot_line
+                    extended_lines += 1
+                    building_adjacency_list = TransportLine.build_adjacency_list()
+
+            # if remaining_resources <= POD_COST:
+            #     debug("remaining resources <= POD_COST, breaking...")
+            #     break
+
+            if extended_lines >= max_lines_extended_per_turn:
+                debug("too many lines extended")
+                break
+
+        debug("/EXTENDING TUBES BETWEEN BUILDINGS....")
 
     if not actions:
         actions.append(ActionWait())
